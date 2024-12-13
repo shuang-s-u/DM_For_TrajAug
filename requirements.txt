@@ -1,0 +1,16 @@
+accelerate
+einops
+ema-pytorch==0.4.7
+numpy
+pillow
+pytorch-fid
+torchdiffeq
+gym[mujoco_py,classic_control]==0.23.0
+tqdm
+wandb
+mujoco==2.2.1
+mujoco-py==2.1.2.14
+sortedcontainers
+pyrallis
+gin-config
+h5py
