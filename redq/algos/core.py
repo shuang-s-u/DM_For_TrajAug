@@ -3,6 +3,9 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.distributions import Distribution, Normal
+from PIL import Image
+import io
+
 # following SAC authors' and OpenAI implementation
 LOG_SIG_MAX = 2
 LOG_SIG_MIN = -20
@@ -37,37 +40,74 @@ class ReplayBuffer:
         self.acts_buf = np.zeros([size, act_dim], dtype=np.float32)
         self.rews_buf = np.zeros(size, dtype=np.float32)
         self.done_buf = np.zeros(size, dtype=np.float32)
+        self.imgs_buf = [None] * size  # 存储图片的列表
         self.ptr, self.size, self.max_size = 0, 0, size
 
-    def store(self, obs, act, rew, next_obs, done):
+    def store(self, obs, act, rew, next_obs, done, img=None):
         """
-        data will get stored in the pointer's location
+        Store the data, including a compressed version of the image.
         """
         self.obs1_buf[self.ptr] = obs
         self.obs2_buf[self.ptr] = next_obs
         self.acts_buf[self.ptr] = act
         self.rews_buf[self.ptr] = rew
         self.done_buf[self.ptr] = done
-        ## move the pointer to store in next location in buffer
-        self.ptr = (self.ptr+1) % self.max_size
-        ## keep track of the current buffer size
-        self.size = min(self.size+1, self.max_size)
+        # 压缩图片并存储
+        if img is not None:
+            self.imgs_buf[self.ptr] = img
+        ## 移动指针到下一个位置
+        self.ptr = (self.ptr + 1) % self.max_size
+        ## 更新当前缓冲区大小
+        self.size = min(self.size + 1, self.max_size)
 
-    def sample_batch(self, batch_size=32, idxs=None):
+    # def sample_batch(self, batch_size=32, idxs=None):
+    #     """
+    #     :param batch_size: size of minibatch
+    #     :param idxs: specify indexes if you want specific data points
+    #     :return: mini-batch data as a dictionary
+    #     """
+    #     if idxs is None:
+    #         idxs = np.random.randint(0, self.size, size=batch_size)
+    #     return dict(obs1=self.obs1_buf[idxs],
+    #                 obs2=self.obs2_buf[idxs],
+    #                 acts=self.acts_buf[idxs],
+    #                 rews=self.rews_buf[idxs],
+    #                 done=self.done_buf[idxs],
+    #                 idxs=idxs)
+    def sample_batch(self, batch_size=32, trajectory_length=None, idxs=None):
         """
         :param batch_size: size of minibatch
+        :param trajectory_length: length of the trajectory to sample
         :param idxs: specify indexes if you want specific data points
         :return: mini-batch data as a dictionary
         """
-        if idxs is None:
-            idxs = np.random.randint(0, self.size, size=batch_size)
-        return dict(obs1=self.obs1_buf[idxs],
-                    obs2=self.obs2_buf[idxs],
-                    acts=self.acts_buf[idxs],
-                    rews=self.rews_buf[idxs],
-                    done=self.done_buf[idxs],
-                    idxs=idxs)
-
+        if trajectory_length is None:
+            # 单步采样
+            if idxs is None:
+                idxs = np.random.randint(0, self.size, size=batch_size)
+            return dict(obs1=self.obs1_buf[idxs],
+                        obs2=self.obs2_buf[idxs],
+                        acts=self.acts_buf[idxs],
+                        rews=self.rews_buf[idxs],
+                        done=self.done_buf[idxs],
+                        idxs=idxs)
+        else:
+            # 轨迹采样
+            trajectories = []
+            for _ in range(batch_size):
+                # 确保采样轨迹不超出缓冲区大小
+                start_idx = np.random.randint(0, self.size - trajectory_length)
+                end_idx = start_idx + trajectory_length
+                # 将一条轨迹加入列表
+                trajectory = dict(
+                    obs1=self.obs1_buf[start_idx:end_idx],
+                    obs2=self.obs2_buf[start_idx:end_idx],
+                    acts=self.acts_buf[start_idx:end_idx],
+                    rews=self.rews_buf[start_idx:end_idx],
+                    done=self.done_buf[start_idx:end_idx]
+                )
+                trajectories.append(trajectory)
+            return trajectories
 
 class Mlp(nn.Module):
     def __init__(

@@ -34,6 +34,7 @@ def redq_sac(
         n_evals_per_epoch=1,
         logger_kwargs=dict(),
         debug=False,
+        trajectory_mode=False,
         # following are agent related hyperparameters
         hidden_sizes=(256, 256),
         replay_size=int(1e6),
@@ -51,9 +52,9 @@ def redq_sac(
         num_min=2,
         q_target_mode='min',
         policy_update_delay=20,
+        # diffusion hyperparameters
         diffusion_buffer_size=int(1e6),
         diffusion_sample_ratio=0.5,
-        # diffusion hyperparameters
         retrain_diffusion_every=10_000,
         num_samples=100_000,
         diffusion_start=0,
@@ -78,13 +79,14 @@ def redq_sac(
     :param n_evals_per_epoch: number of evaluation runs for each epoch
     :param logger_kwargs: arguments for logger
     :param debug: whether to run in debug mode
+
     :param hidden_sizes: hidden layer sizes
-    :param replay_size: replay buffer size
-    :param batch_size: mini-batch size
+    :param replay_size: replay buffer size（100万）
+    :param batch_size: mini-batch size（即每次从Replay Buffer中采样的样本数。）
     :param lr: learning rate for all networks
     :param gamma: discount factor
-    :param polyak: hyperparameter for polyak averaged target networks
-    :param alpha: SAC entropy hyperparameter
+    :param polyak: hyperparameter for polyak averaged target networks（目标网络（Target Network）软更新 的超参数）
+    :param alpha: SAC entropy hyperparameter（SAC算法中的熵系数，控制探索程度。）
     :param auto_alpha: whether to use adaptive SAC
     :param target_entropy: used for adaptive SAC
     :param start_steps: the number of random data collected in the beginning of training
@@ -97,12 +99,17 @@ def redq_sac(
     """
     if debug:  # use --debug for very quick debugging
         hidden_sizes = [2, 2]
+        # mini-batch 大小，即每次从Replay Buffer中采样的样本数。
         batch_size = 2
         utd_ratio = 2
         num_Q = 3
         max_ep_len = 100
         start_steps = 100
         steps_per_epoch = 100
+        retrain_diffusion_every=30
+        #todo: for diffsion
+        train_num_steps = 100000
+        save_and_sample_every = 10000
 
     # use gpu if available
     device = torch.device(f"cuda:{args.cuda}" if torch.cuda.is_available() else "cpu")
@@ -188,15 +195,39 @@ def redq_sac(
                           policy_update_delay)
 
     # set up diffusion model
-    diff_dims = obs_dim + act_dim + 1 + obs_dim
-    if model_terminals:
-        diff_dims += 1
-    inputs = torch.zeros((128, diff_dims)).float()
+    # diff_dims = obs_dim + act_dim + 1 + obs_dim
+    # if model_terminals:
+    #     diff_dims += 1
+    # inputs = torch.zeros((128, diff_dims)).float().to(device)
+    # if skip_reward_norm:
+    #     skip_dims = [obs_dim + act_dim]
+    # else:
+    #     skip_dims = []
+    # 动态设置 diff_dims
+    if trajectory_mode:  # 轨迹模式
+        traj_length = 10  # 假设轨迹长度为 10
+        feature_dim = obs_dim + act_dim + 1 + obs_dim # 状态 + 动作 + 奖励维度
+        diff_dims = traj_length * feature_dim  # 轨迹展开后的总维度
+        # print('###################################trajectory_mode', trajectory_mode)
+        # print('###################################diff_dims', diff_dims)
+    else:  # 单步模式
+        diff_dims = obs_dim + act_dim + 1 + obs_dim  # 单步数据的维度
+        if model_terminals:
+            diff_dims += 1  # 如果需要终止信号，增加一个维度
+
+    # 构造输入张量
+    inputs = torch.zeros((128, diff_dims)).float().to(device)
+
+    # 处理 skip_dims
     if skip_reward_norm:
-        skip_dims = [obs_dim + act_dim]
+        if trajectory_mode:
+            skip_dims = [traj_length * feature_dim - 1]  # 轨迹模式下，最后一个维度是奖励
+        else:
+            skip_dims = [obs_dim + act_dim]  # 单步模式下的奖励维度
     else:
         skip_dims = []
-
+    # ep_ret：当前 episode 的累计回报
+    # ep_len：当前 episode 的长度
     o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
 
     for t in range(total_steps):
@@ -209,11 +240,18 @@ def redq_sac(
         # Ignore the "done" signal if it comes from hitting the time
         # horizon (that is, when it's an artificial terminal signal
         # that isn't based on the agent's state)
+
         ep_len += 1
         d = False if ep_len == max_ep_len else d
+        if t // steps_per_epoch == 1 or t // steps_per_epoch == 298 or t // steps_per_epoch == 299:
+            img = env.render(mode='rgb_array', width=480, height=480, camera_id=0)
+            agent.store_data(o, a, r, o2, d, img)
+        else:
+            # give new data to replay buffer
+            agent.store_data(o, a, r, o2, d, img=None)
 
-        # give new data to replay buffer
-        agent.store_data(o, a, r, o2, d)
+        # # give new data to replay buffer
+        # agent.store_data(o, a, r, o2, d)
         # let agent update
         agent.train(logger)
         # set obs to next obs
@@ -238,42 +276,43 @@ def redq_sac(
                     action_dim=act_dim,
                     skip_dims=skip_dims,
                     disable_terminal_norm=model_terminals,
+                    trajectory_mode=trajectory_mode
                 ),
+                # train_num_steps = train_num_steps,
+                # save_and_sample_every = save_and_sample_every,
                 results_folder=args.results_folder,
                 model_terminals=model_terminals,
             )
             # 将 diffusion_trainer 移动到指定设备
-            diffusion_trainer.update_normalizer(agent.replay_buffer, device=device)
-            diffusion_trainer.train_from_redq_buffer(agent.replay_buffer)
+            diffusion_trainer.update_normalizer(agent.replay_buffer, trajectory_mode=trajectory_mode, device=device)
+            diffusion_trainer.train_from_redq_buffer(buffer=agent.replay_buffer, trajectory_mode=trajectory_mode)
             agent.reset_diffusion_buffer()
 
             # Add samples to agent replay buffer
             generator = SimpleDiffusionGenerator(agent=agent, env=env, ema_model=diffusion_trainer.ema.ema_model)
             observations, actions, rewards, next_observations, terminals = generator.sample(num_samples=num_samples)
-
-            print(f'Adding {num_samples} samples to replay buffer.')
             for o, a, r, o2, term in zip(observations, actions, rewards, next_observations, terminals):
                 agent.diffusion_buffer.store(o, a, r, o2, term)
 
-            if print_buffer_stats:
-                ptr_location = agent.replay_buffer.ptr
-                real_observations = agent.replay_buffer.obs1_buf[:ptr_location]
-                real_actions = agent.replay_buffer.acts_buf[:ptr_location]
-                real_next_observations = agent.replay_buffer.obs2_buf[:ptr_location]
-                real_rewards = agent.replay_buffer.rews_buf[:ptr_location]
-                # Print min, max, mean, std of each dimension in the obs, rew and action
-                print('Buffer stats:')
-                for i in range(observations.shape[1]):
-                    print(f'Diffusion Obs {i}: {np.mean(observations[:, i]):.2f} {np.std(observations[:, i]):.2f}')
-                    print(
-                        f'     Real Obs {i}: {np.mean(real_observations[:, i]):.2f} {np.std(real_observations[:, i]):.2f}')
-                for i in range(actions.shape[1]):
-                    print(f'Diffusion Action {i}: {np.mean(actions[:, i]):.2f} {np.std(actions[:, i]):.2f}')
-                    print(f'     Real Action {i}: {np.mean(real_actions[:, i]):.2f} {np.std(real_actions[:, i]):.2f}')
-                print(f'Diffusion Reward: {np.mean(rewards):.2f} {np.std(rewards):.2f}')
-                print(f'     Real Reward: {np.mean(real_rewards):.2f} {np.std(real_rewards):.2f}')
-                print(f'Replay buffer size: {ptr_location}')
-                print(f'Diffusion buffer size: {agent.diffusion_buffer.ptr}')
+            # if print_buffer_stats:
+            #     ptr_location = agent.replay_buffer.ptr
+            #     real_observations = agent.replay_buffer.obs1_buf[:ptr_location]
+            #     real_actions = agent.replay_buffer.acts_buf[:ptr_location]
+            #     real_next_observations = agent.replay_buffer.obs2_buf[:ptr_location]
+            #     real_rewards = agent.replay_buffer.rews_buf[:ptr_location]
+            #     # Print min, max, mean, std of each dimension in the obs, rew and action
+            #     print('Buffer stats:')
+            #     for i in range(observations.shape[1]):
+            #         print(f'Diffusion Obs {i}: {np.mean(observations[:, i]):.2f} {np.std(observations[:, i]):.2f}')
+            #         print(
+            #             f'     Real Obs {i}: {np.mean(real_observations[:, i]):.2f} {np.std(real_observations[:, i]):.2f}')
+            #     for i in range(actions.shape[1]):
+            #         print(f'Diffusion Action {i}: {np.mean(actions[:, i]):.2f} {np.std(actions[:, i]):.2f}')
+            #         print(f'     Real Action {i}: {np.mean(real_actions[:, i]):.2f} {np.std(real_actions[:, i]):.2f}')
+            #     print(f'Diffusion Reward: {np.mean(rewards):.2f} {np.std(rewards):.2f}')
+            #     print(f'     Real Reward: {np.mean(real_rewards):.2f} {np.std(real_rewards):.2f}')
+            #     print(f'Replay buffer size: {ptr_location}')
+            #     print(f'Diffusion buffer size: {agent.diffusion_buffer.ptr}')
 
         # End of epoch wrap-up
         if (t + 1) % steps_per_epoch == 0:
@@ -287,6 +326,31 @@ def redq_sac(
             # reseed should improve reproducibility (should make results the same whether bias evaluation is on or not)
             if reseed_each_epoch:
                 seed_all(epoch)
+
+            if epoch == 1 or epoch == 298 or epoch == 299:
+                ptr_location = agent.replay_buffer.ptr
+                real_observations = agent.replay_buffer.obs1_buf[:ptr_location]
+                real_actions = agent.replay_buffer.acts_buf[:ptr_location]
+                real_next_observations = agent.replay_buffer.obs2_buf[:ptr_location]
+                real_rewards = agent.replay_buffer.rews_buf[:ptr_location]
+                # 提取图片数据并解压
+                # 提取最后 500 张图片（如果 buffer 的总数不足 500，则从头开始提取）
+                print(f'ptr_location {ptr_location}')
+                start_index = max(0, ptr_location - 1000)  # 确保起点不会低于 0
+                real_images = agent.replay_buffer.imgs_buf[start_index:ptr_location]
+                # real_images = [agent.replay_buffer.decompress_image(img_data) for img_data in agent.replay_buffer.imgs_buf[:ptr_location]]
+
+                if (t+1) >= 0 :
+                    save_path = f"{args.results_folder}/quadruped-walk-v0/images_trajectories_step_{t + 1}.pt"  # 根据训练步骤保存
+                    save_trajectories(
+                        observations=real_observations,
+                        actions=real_actions,
+                        rewards=real_rewards,
+                        next_observations=real_next_observations,
+                        images=real_images,
+                        file_path=save_path
+                    )
+                print('####################quadruped-walk-v0存储状态图像成功')
 
             """logging"""
             # Log info about epoch
@@ -345,6 +409,19 @@ def get_time_limit(env: gym.Env):
     else:
         raise ValueError("Cannot find time limit for env")
 
+# 保存轨迹为 .pt 文件
+def save_trajectories(observations, actions, rewards, next_observations, images, file_path):
+    # 创建一个字典保存轨迹
+    trajectories = {
+        'observations': observations,
+        'actions': actions,
+        'rewards': rewards,
+        'next_observations': next_observations,
+        'images': images
+    }
+    # 保存为 .pt 文件
+    torch.save(trajectories, file_path)
+    print(f"Trajectories saved to {file_path}")
 
 if __name__ == '__main__':
     import argparse
@@ -353,14 +430,14 @@ if __name__ == '__main__':
     parser.add_argument('--env', type=str, default='Hopper-v2')
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--exp_name', type=str, default='redq_sac')
-    parser.add_argument('--data_dir', type=str, default='online_logs')
+    parser.add_argument('--data_dir', type=str, default='online_logs_ce')
     parser.add_argument('--results_folder', type=str, default='./results')
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--project_name', type=str, default='diffusion_online')
     parser.add_argument('--gin_config_files', nargs='*', type=str,
                         default=['config/online/sac_synther_dmc.gin'])
     parser.add_argument('--cuda', type=int, default=-1, help="CUDA device ID (use -1 for CPU)")  # 添加cuda号
-
+    parser.add_argument('--trajectory_mode', action='store_true')
     parser.add_argument('--gin_params', nargs='*', type=str, default=[])
     args = parser.parse_args()
 
@@ -374,5 +451,5 @@ if __name__ == '__main__':
     gin.parse_config_files_and_bindings(args.gin_config_files, args.gin_params)
 
     redq_sac(args.env, seed=args.seed,
-             debug=args.debug, target_entropy='auto', project_name=args.project_name,
+             debug=args.debug, trajectory_mode=args.trajectory_mode, target_entropy='auto', project_name=args.project_name,
              logger_kwargs=logger_kwargs)

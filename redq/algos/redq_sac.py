@@ -87,14 +87,14 @@ class REDQSACAgent(object):
         self.policy_update_delay = policy_update_delay
         self.device = device
     
-    def __get_current_num_data(self):
+    def _get_current_num_data(self):
         # used to determine whether we should get action from policy or take random starting actions
         return self.replay_buffer.size
 
     def get_exploration_action(self, obs, env):
         # given an observation, output a sampled action in numpy form
         with torch.no_grad():
-            if self.__get_current_num_data() > self.start_steps:
+            if self._get_current_num_data() > self.start_steps:
                 obs_tensor = torch.Tensor(obs).unsqueeze(0).to(self.device)
                 action_tensor = self.policy_net.forward(obs_tensor, deterministic=False,
                                              return_log_prob=False)[0]
@@ -131,9 +131,12 @@ class REDQSACAgent(object):
         average_q_prediction = torch.mean(q_prediction_cat, dim=1)
         return average_q_prediction
 
-    def store_data(self, o, a, r, o2, d):
+    # def store_data(self, o, a, r, o2, d):
+    #     # store one transition to the buffer
+    #     self.replay_buffer.store(o, a, r, o2, d)
+    def store_data(self, o, a, r, o2, d, img):
         # store one transition to the buffer
-        self.replay_buffer.store(o, a, r, o2, d)
+        self.replay_buffer.store(o, a, r, o2, d, img)
 
     def sample_data(self, batch_size):
         # sample data from replay buffer
@@ -192,7 +195,7 @@ class REDQSACAgent(object):
     def train(self, logger):
         # this function is called after each datapoint collected.
         # when we only have very limited data, we don't make updates
-        num_update = 0 if self.__get_current_num_data() <= self.delay_update_steps else self.utd_ratio
+        num_update = 0 if self._get_current_num_data() <= self.delay_update_steps else self.utd_ratio
         for i_update in range(num_update):
             obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor = self.sample_data(self.batch_size)
 

@@ -73,8 +73,15 @@ def construct_diffusion_model(
         disable_terminal_norm: bool = False,
         skip_dims: List[int] = [],
         cond_dim: Optional[int] = None,
+        trajectory_mode: bool = True,  # 新增参数
 ) -> ElucidatedDiffusion:
-    event_dim = inputs.shape[1]
+    if trajectory_mode:
+        traj_length = inputs.shape[1] // (obs_dim + action_dim + 1 + obs_dim)  # 根据输入形状推断轨迹长度
+        feature_dim = obs_dim + action_dim + 1 + obs_dim # 单步特征维度
+        event_dim = traj_length * feature_dim  # 轨迹总维度
+    else:
+        event_dim = inputs.shape[1]
+    # event_dim = inputs.shape[1]
     model = denoising_network(d_in=event_dim, cond_dim=cond_dim)
 
     if disable_terminal_norm:

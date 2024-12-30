@@ -56,7 +56,7 @@ class RandomOrLearnedSinusoidalPosEmb(nn.Module):
         x = x.to(config.device)
         self.weights.data = self.weights.data.to(config.device)
         x = rearrange(x, 'b -> b 1')
-        print(f'x deive:  {x.device}.. w device:  {self.weights.device}')
+        # print(f'x deive:  {x.device}.. w device:  {self.weights.device}')
         freqs = x * rearrange(self.weights, 'd -> 1 d') * 2 * math.pi
         fouriered = torch.cat((freqs.sin(), freqs.cos()), dim=-1)
         fouriered = torch.cat((x, fouriered), dim=-1)

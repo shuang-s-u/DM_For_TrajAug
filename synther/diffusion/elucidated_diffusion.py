@@ -512,11 +512,18 @@ class Trainer(object):
             data: torch.Tensor,
             use_wandb=True,
             splits=1,  # number of splits to split the batch into
+            trajectory_mode=False,  # 新增参数：是否使用轨迹数据模式
+            grad_clip_value=1.0,  # 新增参数：动态梯度裁剪值
             **kwargs,
     ):
         accelerator = self.accelerator
         device = accelerator.device
         data = data.to(device)
+
+        # 新增逻辑：轨迹模式支持
+        if trajectory_mode:
+            batch_size, traj_length, feature_dim = data.shape  # 确定轨迹维度
+            data = data.view(batch_size, traj_length * feature_dim)  # 展平为 [batch_size, traj_length * feature_dim]
 
         total_loss = 0.
         if splits == 1:
@@ -530,7 +537,7 @@ class Trainer(object):
 
             for idx, d in enumerate(split_data):
                 with self.accelerator.autocast():
-                    # Split condition as well
+                    # 修改逻辑：增强分割处理逻辑，分割条件参数
                     new_kwargs = {}
                     for k, v in kwargs.items():
                         if isinstance(v, torch.Tensor):
@@ -543,12 +550,16 @@ class Trainer(object):
                     total_loss += loss.item()
                 self.accelerator.backward(loss)
 
-        accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
+        # 修改逻辑：动态梯度裁剪值
+        accelerator.clip_grad_norm_(self.model.parameters(), grad_clip_value)
+
         if use_wandb:
+            # 修改逻辑：增强日志记录，添加梯度裁剪值
             wandb.log({
                 'step': self.step,
                 'loss': total_loss,
                 'lr': self.opt.param_groups[0]['lr'],
+                'grad_clip': grad_clip_value,  # 新增记录项
             })
 
         accelerator.wait_for_everyone()
@@ -614,27 +625,79 @@ class REDQTrainer(Trainer):
 
         self.model_terminals = model_terminals
 
-    def train_from_redq_buffer(self, buffer: ReplayBuffer, num_steps: Optional[int] = None):
+    def train_from_redq_buffer(
+            self, buffer: ReplayBuffer, num_steps: Optional[int] = None, trajectory_mode: bool = False
+    ):
+        """
+        从 REDQ buffer 训练扩散模型
+        :param buffer: ReplayBuffer 对象
+        :param num_steps: 训练步数
+        :param trajectory_mode: 是否启用轨迹模式
+        """
         num_steps = num_steps or self.train_num_steps
+        trajectory_length = 10  # 默认轨迹长度为 10
+        print('num_steps',num_steps)
+
         for j in range(num_steps):
-            b = buffer.sample_batch(self.batch_size)
-            obs = b['obs1']
-            next_obs = b['obs2']
-            actions = b['acts']
-            rewards = b['rews'][:, None]
-            done = b['done'][:, None]
-            data = [obs, actions, rewards, next_obs]
-            if self.model_terminals:
-                data.append(done)
-            data = np.concatenate(data, axis=1)
-            data = torch.from_numpy(data).float().to(config.device)
-            loss = self.train_on_batch(data, use_wandb=False)
+            if trajectory_mode:
+                # 从 buffer 中采样轨迹数据
+                trajectories = buffer.sample_batch(self.batch_size, trajectory_length=trajectory_length)
+                # 处理轨迹数据
+                traj_data = []
+                for traj in trajectories:
+                    obs = traj['obs1']
+                    next_obs = traj['obs2']
+                    actions = traj['acts']
+                    rewards = traj['rews'][:, None]
+                    done = traj['done'][:, None]
+                    data = [obs, actions, rewards, next_obs]
+                    if self.model_terminals:
+                        data.append(done)
+                    traj_data.append(np.concatenate(data, axis=1))
+
+                # 将轨迹列表转换为批次张量
+                # # 形状为 (batch_size, traj_length, feature_dim)
+                traj_data = np.stack(traj_data, axis=0)
+
+                data = torch.from_numpy(traj_data).float().to(config.device)
+                ## ([256, 10, 169])
+                # print('#############################traj_', data.shape)
+
+                # traj_data = np.stack(traj_data)  # 拼接所有时间步
+                # data = traj_data.reshape(batch_size, -1)  # (batch_size, traj_length * feature_dim)
+            else:
+                # 单步处理模式
+                b = buffer.sample_batch(self.batch_size)
+                obs = b['obs1']
+                next_obs = b['obs2']
+                actions = b['acts']
+                rewards = b['rews'][:, None]
+                done = b['done'][:, None]
+                data = [obs, actions, rewards, next_obs]
+                if self.model_terminals:
+                    data.append(done)
+                data = np.concatenate(data, axis=1)
+                data = torch.from_numpy(data).float().to(config.device)
+
+            # 扩散模型的训练（根据数据模式处理）
+            loss = self.train_on_batch(data, use_wandb=False, trajectory_mode=trajectory_mode)
             if j % 1000 == 0:
                 print(f'[{j}/{num_steps}] loss: {loss:.4f}')
 
-    def update_normalizer(self, buffer: ReplayBuffer, device=None):
-        data = make_inputs_from_replay_buffer(buffer, self.model_terminals)
-        data = torch.from_numpy(data).float().to(config.device)
+    def update_normalizer(self, buffer: ReplayBuffer, trajectory_mode, device=None):
+        data = make_inputs_from_replay_buffer(buffer, model_terminals=self.model_terminals, trajectory_mode=trajectory_mode, trajectory_length=10)
+        print(data.shape)  
+        # 输出形状：[num_trajectories, trajectory_length, feature_dim]
+        # data = make_inputs_from_replay_buffer(buffer, self.model_terminals)
+        # 如果是轨迹模式，展平数据以适配正则化器
+        if trajectory_mode:
+            batch_size, traj_length, feature_dim = data.shape
+            # 确保 data 是 PyTorch Tensor
+            if not isinstance(data, torch.Tensor):
+                data = torch.tensor(data, dtype=torch.float32, device=config.device)
+            data = data.view(batch_size, traj_length*feature_dim)
+        # data = torch.from_numpy(data).float().to(config.device)
+        data = data.float().to(config.device)
         self.model.normalizer.reset(data)
         self.ema.ema_model.normalizer.reset(data)
         if device:
